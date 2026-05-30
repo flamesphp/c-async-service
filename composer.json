@@ -1,0 +1,8 @@
+{
+  "name": "flamesphp/c-async-service",
+  "description": "Flames: Async Service (C)",
+  "minimum-stability": "dev",
+  "prefer-stable": true,
+  "license": "MIT"
+}
+
