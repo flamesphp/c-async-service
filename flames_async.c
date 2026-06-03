@@ -1,32 +1,3 @@
-/*
- * Flames Async Service - PHP Extension
- *
- * Fork-based real parallelism for PHP closures.
- *
- * PHP API
- * ───────
- *   use Flames\Async\Async\Service;
- *
- *   $task  = Service::async(callable $fn)         → Task object, fork starts immediately
- *   $value = Service::await($task)                → blocks, returns value
- *   $arr   = Service::await($task1, $task2, …)    → blocks, returns indexed array
- *
- *   $task->isDone()   → non-blocking poll (bool)
- *   $task->result()   → same as Service::await($task)
- *
- * Serialization
- * ─────────────
- *   If the igbinary extension is loaded, igbinary_serialize / igbinary_unserialize
- *   are used for the pipe payload (faster, binary, supports more types).
- *   Otherwise falls back to PHP's native serialize / unserialize.
- *   The decision is made once per process and cached.
- *
- * Wire protocol (1-byte status header)
- * ─────────────────────────────────────
- *   0x01 + <serialized payload>   → success
- *   0x02 + <utf-8 error message>  → exception / call failure
- */
-
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -43,17 +14,10 @@
 #include "ext/spl/spl_exceptions.h"
 #include "zend_smart_str.h"
 #include "zend_exceptions.h"
-
-/* =========================================================================
- * Wire-protocol status bytes
- * ========================================================================= */
+================================================================== */
 
 #define ASYNC_STATUS_OK    ((char)0x01)
 #define ASYNC_STATUS_ERROR ((char)0x02)
-
-/* =========================================================================
- * igbinary runtime detection (cached after first call)
- * ========================================================================= */
 
 static int  flames_igbinary_checked   = 0;
 static bool flames_igbinary_available = false;
@@ -70,10 +34,6 @@ static void flames_detect_igbinary(void)
     flames_igbinary_checked = 1;
 }
 
-/* -----------------------------------------------------------------
- * Serialize a zval → smart_str buffer
- *   uses igbinary if available, otherwise native serialize
- * ----------------------------------------------------------------- */
 static void flames_serialize(zval *value, smart_str *buf)
 {
     flames_detect_igbinary();
@@ -100,11 +60,6 @@ static void flames_serialize(zval *value, smart_str *buf)
     }
 }
 
-/* -----------------------------------------------------------------
- * Unserialize raw bytes → zval
- *   uses igbinary if available, otherwise native unserialize
- *   returns SUCCESS or FAILURE
- * ----------------------------------------------------------------- */
 static int flames_unserialize(zval *result, const char *data, size_t len)
 {
     flames_detect_igbinary();
@@ -132,18 +87,11 @@ static int flames_unserialize(zval *result, const char *data, size_t len)
     }
 }
 
-/* =========================================================================
- * Task object handlers  (\Flames\Async\Service\Task)
- * ========================================================================= */
-
 static zend_object_handlers flames_async_task_handlers;
 
 zend_class_entry *flames_async_service_ce;
 zend_class_entry *flames_async_task_ce;
 
-/* -----------------------------------------------------------------
- * Object allocator
- * ----------------------------------------------------------------- */
 static zend_object *flames_async_task_create_object(zend_class_entry *ce)
 {
     flames_async_task *task = ecalloc(
@@ -163,9 +111,6 @@ static zend_object *flames_async_task_create_object(zend_class_entry *ce)
     return &task->std;
 }
 
-/* -----------------------------------------------------------------
- * Object destructor – clean up on last-reference drop
- * ----------------------------------------------------------------- */
 static void flames_async_task_free_object(zend_object *obj)
 {
     flames_async_task *task = flames_async_task_from_obj(obj);
@@ -176,7 +121,6 @@ static void flames_async_task_free_object(zend_object *obj)
     }
 
     if (!task->done && task->child_pid > 0) {
-        /* Task was discarded without being awaited – reap child. */
         kill(task->child_pid, SIGKILL);
         waitpid(task->child_pid, NULL, 0);
         task->child_pid = -1;
@@ -195,9 +139,6 @@ static void flames_async_task_free_object(zend_object *obj)
     zend_object_std_dtor(obj);
 }
 
-/* =========================================================================
- * Internal: block until child result is collected from pipe
- * ========================================================================= */
 static void flames_async_collect(flames_async_task *task)
 {
     if (task->done) {
@@ -210,7 +151,6 @@ static void flames_async_collect(flames_async_task *task)
         return;
     }
 
-    /* Blocking read – drains the pipe until the child closes its write end. */
     smart_str buf = {0};
     char      tmp[8192];
     ssize_t   n;
@@ -222,7 +162,6 @@ static void flames_async_collect(flames_async_task *task)
     close(task->pipe_read_fd);
     task->pipe_read_fd = -1;
 
-    /* Reap child. */
     waitpid(task->child_pid, NULL, 0);
     task->child_pid = -1;
     task->done      = 1;
@@ -260,11 +199,6 @@ static void flames_async_collect(flames_async_task *task)
     smart_str_free(&buf);
 }
 
-/* =========================================================================
- * \Flames\Async\Service\Task – instance methods
- * ========================================================================= */
-
-/* {{{ Task::isDone(): bool */
 PHP_METHOD(FlamesAsyncServiceTask, isDone)
 {
     ZEND_PARSE_PARAMETERS_NONE();
@@ -279,7 +213,6 @@ PHP_METHOD(FlamesAsyncServiceTask, isDone)
         RETURN_FALSE;
     }
 
-    /* Non-blocking poll via select(). */
     fd_set         rset;
     struct timeval tv = {0, 0};
     FD_ZERO(&rset);
@@ -294,13 +227,7 @@ PHP_METHOD(FlamesAsyncServiceTask, isDone)
 
     RETURN_FALSE;
 }
-/* }}} */
 
-/* {{{ Task::result(): mixed
- *
- * Blocks until the child finishes and returns its return value.
- * Throws RuntimeException if the child threw an exception.
- */
 PHP_METHOD(FlamesAsyncServiceTask, result)
 {
     ZEND_PARSE_PARAMETERS_NONE();
@@ -316,17 +243,7 @@ PHP_METHOD(FlamesAsyncServiceTask, result)
 
     ZVAL_COPY(return_value, &task->result);
 }
-/* }}} */
 
-/* =========================================================================
- * \Flames\Async\Async\Service – static methods
- * ========================================================================= */
-
-/* {{{ Service::async(callable $fn): \Flames\Async\Service\Task
- *
- * Forks immediately and starts executing $fn() in the child.
- * Returns a Task object without waiting for the child.
- */
 PHP_METHOD(FlamesAsyncService, async)
 {
     zval *callable;
@@ -335,7 +252,6 @@ PHP_METHOD(FlamesAsyncService, async)
         Z_PARAM_ZVAL(callable)
     ZEND_PARSE_PARAMETERS_END();
 
-    /* Create the Task object that will hold the fork state. */
     object_init_ex(return_value, flames_async_task_ce);
     flames_async_task *task = FLAMES_ASYNC_TASK_FROM_ZVAL(return_value);
 
@@ -357,10 +273,7 @@ PHP_METHOD(FlamesAsyncService, async)
     }
 
     if (pid == 0) {
-        /* ================================================================
-         * CHILD PROCESS
-         * ================================================================ */
-        close(fds[0]); /* child never reads */
+        close(fds[0]);
 
         if (EG(exception)) {
             zend_clear_exception();
@@ -373,7 +286,6 @@ PHP_METHOD(FlamesAsyncService, async)
                       && !EG(exception);
 
         if (call_ok) {
-            /* ---- SUCCESS ---- */
             smart_str sbuf = {0};
             flames_serialize(&retval, &sbuf);
             zval_ptr_dtor(&retval);
@@ -394,7 +306,6 @@ PHP_METHOD(FlamesAsyncService, async)
             }
 
         } else {
-            /* ---- EXCEPTION / ERROR ---- */
             const char  *errmsg = "Unknown error in async closure";
             size_t       errlen = 30;
             zend_string *exc_str = NULL;
@@ -423,27 +334,14 @@ PHP_METHOD(FlamesAsyncService, async)
         }
 
         close(fds[1]);
-        _exit(0); /* intentional: bypass PHP/C++ atexit handlers in child */
+        _exit(0);
     }
 
-    /* ================================================================
-     * PARENT PROCESS
-     * ================================================================ */
-    close(fds[1]); /* parent never writes */
+    close(fds[1]);
     task->pipe_read_fd = fds[0];
     task->child_pid    = pid;
 }
-/* }}} */
 
-/* {{{ Service::await(\Flames\Async\Service\Task ...$tasks): mixed
- *
- * Blocks until all listed tasks finish, then returns:
- *   - single task  → the task's return value directly
- *   - multiple     → indexed array [ result0, result1, … ]
- *
- * All children were forked at Service::async() time and are already
- * running concurrently.  Total wall-time ≈ max(task durations), not sum.
- */
 PHP_METHOD(FlamesAsyncService, await)
 {
     zval *tasks     = NULL;
@@ -453,7 +351,6 @@ PHP_METHOD(FlamesAsyncService, await)
         Z_PARAM_VARIADIC('+', tasks, num_tasks)
     ZEND_PARSE_PARAMETERS_END();
 
-    /* Validate: every argument must be a Task instance. */
     for (int i = 0; i < num_tasks; i++) {
         if (Z_TYPE(tasks[i]) != IS_OBJECT
             || !instanceof_function(Z_OBJCE(tasks[i]), flames_async_task_ce))
@@ -500,22 +397,12 @@ PHP_METHOD(FlamesAsyncService, await)
         }
     }
 }
-/* }}} */
 
-/* =========================================================================
- * __flames_c_async_service_version__()
- *
- * Returns the version string embedded from config.yml at build time.
- * ========================================================================= */
 PHP_FUNCTION(flames_c_async_service_version)
 {
     ZEND_PARSE_PARAMETERS_NONE();
     RETURN_STRING(PHP_FLAMES_ASYNC_CONFIG_VERSION);
 }
-
-/* =========================================================================
- * Module registration
- * ========================================================================= */
 
 static const zend_function_entry flames_async_service_methods[] = {
     PHP_ME(FlamesAsyncService, async, arginfo_Service_async, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
@@ -540,13 +427,11 @@ PHP_MINIT_FUNCTION(flames_async)
 {
     zend_class_entry ce;
 
-    /* \Flames\Async\Async\Service */
     INIT_CLASS_ENTRY(ce, "Flames\\Async\\Async\\Service", flames_async_service_methods);
     flames_async_service_ce = zend_register_internal_class(&ce);
     flames_async_service_ce->ce_flags |= ZEND_ACC_FINAL
                                        | ZEND_ACC_NO_DYNAMIC_PROPERTIES;
 
-    /* \Flames\Async\Async\Service\Task */
     INIT_CLASS_ENTRY(ce, "Flames\\Async\\Async\\Service\\Task", flames_async_task_methods);
     flames_async_task_ce = zend_register_internal_class(&ce);
     flames_async_task_ce->create_object = flames_async_task_create_object;
@@ -554,7 +439,6 @@ PHP_MINIT_FUNCTION(flames_async)
                                         | ZEND_ACC_NO_DYNAMIC_PROPERTIES
                                         | ZEND_ACC_NOT_SERIALIZABLE;
 
-    /* Custom object handlers for Task */
     memcpy(&flames_async_task_handlers,
            zend_get_std_object_handlers(),
            sizeof(zend_object_handlers));
@@ -565,9 +449,6 @@ PHP_MINIT_FUNCTION(flames_async)
     return SUCCESS;
 }
 
-/* -----------------------------------------------------------------
- * MINFO: shown in phpinfo()
- * ----------------------------------------------------------------- */
 PHP_MINFO_FUNCTION(flames_async)
 {
     php_info_print_table_start();
@@ -582,17 +463,14 @@ PHP_MINFO_FUNCTION(flames_async)
     php_info_print_table_end();
 }
 
-/* -----------------------------------------------------------------
- * Module entry
- * ----------------------------------------------------------------- */
 zend_module_entry flames_async_module_entry = {
     STANDARD_MODULE_HEADER,
     PHP_FLAMES_ASYNC_EXTNAME,
     flames_async_functions,
     PHP_MINIT(flames_async),
-    NULL,                   /* MSHUTDOWN */
-    NULL,                   /* RINIT     */
-    NULL,                   /* RSHUTDOWN */
+    NULL,
+    NULL,
+    NULL,
     PHP_MINFO(flames_async),
     PHP_FLAMES_ASYNC_VERSION,
     STANDARD_MODULE_PROPERTIES
