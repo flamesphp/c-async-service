@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <sys/epoll.h>
+#include <sys/timerfd.h>
 #include <signal.h>
 
 #include "php_flames_async.h"
@@ -55,14 +56,23 @@ static int  g_flames_hooks_installed   = 0;
  * Avoids depending on any PHP-version-specific internal fiber field. */
 static bool g_flames_fiber_executing   = false;
 
-/* Wrappers that maintain g_flames_fiber_executing around every start/resume/throw.
- * The flag is true while fiber PHP code is on the call stack so that
- * flames_hooks_active() returns true only when inside a managed coroutine. */
+/*
+ * PHP 8.5 removed Fiber::getSuspendedValue().  The suspended value is now
+ * only available as the return of start() / resume() / throw().
+ * We store it here after every fiber call so that flames_process_fiber_step()
+ * can read it without calling the removed method.
+ */
+static zval g_flames_last_suspended_value;
+
+/* Wrappers that maintain g_flames_fiber_executing around every start/resume/throw
+ * and capture the suspended value into g_flames_last_suspended_value. */
 static inline void flames_fiber_start(zend_object *fib_obj, zval *ret)
 {
     g_flames_fiber_executing = true;
     FLAMES_CALL0(fib_obj, zend_ce_fiber, NULL, "start", ret);
     g_flames_fiber_executing = false;
+    zval_ptr_dtor(&g_flames_last_suspended_value);
+    ZVAL_COPY(&g_flames_last_suspended_value, ret);
 }
 
 static inline void flames_fiber_resume(zend_object *fib_obj, zval *ret, zval *val)
@@ -70,6 +80,8 @@ static inline void flames_fiber_resume(zend_object *fib_obj, zval *ret, zval *va
     g_flames_fiber_executing = true;
     FLAMES_CALL1(fib_obj, zend_ce_fiber, NULL, "resume", ret, val);
     g_flames_fiber_executing = false;
+    zval_ptr_dtor(&g_flames_last_suspended_value);
+    ZVAL_COPY(&g_flames_last_suspended_value, ret);
 }
 
 static inline void flames_fiber_throw_obj(zend_object *fib_obj, zval *ret, zval *ex)
@@ -77,6 +89,8 @@ static inline void flames_fiber_throw_obj(zend_object *fib_obj, zval *ret, zval 
     g_flames_fiber_executing = true;
     FLAMES_CALL1(fib_obj, zend_ce_fiber, NULL, "throw", ret, ex);
     g_flames_fiber_executing = false;
+    zval_ptr_dtor(&g_flames_last_suspended_value);
+    ZVAL_COPY(&g_flames_last_suspended_value, ret);
 }
 
 static php_stream_ops          g_flames_hook_sock_ops;
@@ -555,6 +569,7 @@ static void flames_async_promise_free_object(zend_object *obj)
 
 typedef struct {
     int  fd;
+    int  close_fd;   /* 1 = this fd is owned (timerfd), close when removing */
     zval fiber;
     zval inner_promise;
     zval outer_promise;
@@ -569,6 +584,7 @@ static void flames_loop_init(void)
     if (g_epoll_fd >= 0) { return; }
     g_epoll_fd     = epoll_create1(EPOLL_CLOEXEC);
     g_waiter_count = 0;
+    ZVAL_NULL(&g_flames_last_suspended_value);
 }
 
 static void flames_loop_destroy(void)
@@ -582,6 +598,8 @@ static void flames_loop_destroy(void)
         zval_ptr_dtor(&g_waiters[i].outer_promise);
     }
     g_waiter_count = 0;
+    zval_ptr_dtor(&g_flames_last_suspended_value);
+    ZVAL_NULL(&g_flames_last_suspended_value);
     if (g_epoll_fd >= 0) { close(g_epoll_fd); g_epoll_fd = -1; }
 }
 
@@ -590,10 +608,13 @@ static void flames_loop_add_waiter(int fd, zval *fiber, zval *inner_p, zval *out
     if (g_waiter_count >= FLAMES_MAX_WAITERS) { return; }
 
     unsigned int epoll_events = EPOLLIN;
+    int          close_fd     = 0;
     if (inner_p && Z_TYPE_P(inner_p) == IS_OBJECT
         && instanceof_function(Z_OBJCE_P(inner_p), flames_async_promise_ce))
     {
-        epoll_events = FLAMES_ASYNC_PROMISE_FROM_ZVAL(inner_p)->epoll_events;
+        flames_async_promise *pp = FLAMES_ASYNC_PROMISE_FROM_ZVAL(inner_p);
+        epoll_events = pp->epoll_events;
+        close_fd     = pp->close_fd;
     }
 
     if (fd >= 0) {
@@ -604,7 +625,8 @@ static void flames_loop_add_waiter(int fd, zval *fiber, zval *inner_p, zval *out
     }
 
     int i = g_waiter_count++;
-    g_waiters[i].fd = fd;
+    g_waiters[i].fd       = fd;
+    g_waiters[i].close_fd = close_fd;
     ZVAL_COPY(&g_waiters[i].fiber,         fiber);
     ZVAL_COPY(&g_waiters[i].inner_promise, inner_p);
     ZVAL_COPY(&g_waiters[i].outer_promise, outer_p);
@@ -614,6 +636,9 @@ static void flames_loop_remove_waiter(int idx)
 {
     if (g_waiters[idx].fd >= 0) {
         epoll_ctl(g_epoll_fd, EPOLL_CTL_DEL, g_waiters[idx].fd, NULL);
+        if (g_waiters[idx].close_fd) {
+            close(g_waiters[idx].fd);
+        }
     }
     zval_ptr_dtor(&g_waiters[idx].fiber);
     zval_ptr_dtor(&g_waiters[idx].inner_promise);
@@ -679,9 +704,11 @@ static void flames_process_fiber_step(zval *fiber, zval *outer_promise)
     }
     zval_ptr_dtor(&is_term);
 
-    /* Fiber suspended — get the Promise it is waiting on */
+    /* Fiber suspended — read the Promise from g_flames_last_suspended_value.
+     * (Fiber::getSuspendedValue() was removed in PHP 8.5; the suspended value
+     *  is the return of start() / resume() / throw(), already captured above.) */
     zval inner;
-    FLAMES_CALL0(Z_OBJ_P(fiber), zend_ce_fiber, NULL, "getSuspendedValue", &inner);
+    ZVAL_COPY(&inner, &g_flames_last_suspended_value);
 
     if (Z_TYPE(inner) != IS_OBJECT
         || !instanceof_function(Z_OBJCE(inner), flames_async_promise_ce))
@@ -906,6 +933,121 @@ static void flames_stream_ensure_hooked(php_stream *stream)
     {
         stream->ops = (const php_stream_ops *)&g_flames_hook_ssl_ops;
         flames_stream_set_nonblock(stream);
+    }
+}
+
+/* ---- Async sleep via timerfd ---- */
+
+/*
+ * Original handlers for sleep() and usleep() – saved during MINIT so we
+ * can call through to the real implementation when outside a coroutine.
+ */
+static zif_handler orig_sleep_handler  = NULL;
+static zif_handler orig_usleep_handler = NULL;
+
+/*
+ * Core async-sleep: create a timerfd, register it with epoll via a Promise,
+ * and suspend the current Fiber until the timer fires.
+ * Falls back to blocking usleep() if timerfd is unavailable.
+ */
+static void flames_do_async_sleep(double seconds)
+{
+    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (tfd < 0) {
+        /* timerfd unavailable – fall back to blocking */
+        useconds_t usec = (useconds_t)(seconds * 1e6);
+        if (usec > 0) { usleep(usec); }
+        return;
+    }
+
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_sec  = (time_t)seconds;
+    its.it_value.tv_nsec = (long)((seconds - (time_t)seconds) * 1000000000L);
+    if (its.it_value.tv_sec == 0 && its.it_value.tv_nsec == 0) {
+        its.it_value.tv_nsec = 1; /* minimum 1 ns */
+    }
+    timerfd_settime(tfd, 0, &its, NULL);
+
+    flames_loop_init();
+
+    zval promise_zv, fn, suspend_ret;
+    object_init_ex(&promise_zv, flames_async_promise_ce);
+    flames_async_promise *p = FLAMES_ASYNC_PROMISE_FROM_ZVAL(&promise_zv);
+    p->fd           = tfd;
+    p->wait_mode    = FLAMES_PROMISE_WAIT_READY;
+    p->epoll_events = EPOLLIN;
+    p->close_fd     = 1; /* timerfd is owned – close after epoll fires */
+
+    ZVAL_STRING(&fn, "Fiber::suspend");
+    call_user_function(NULL, NULL, &fn, &suspend_ret, 1, &promise_zv);
+    zval_ptr_dtor(&fn);
+    zval_ptr_dtor(&suspend_ret);
+    zval_ptr_dtor(&promise_zv);
+}
+
+/* flames_async_sleep(float $seconds): void – callable from PHP */
+PHP_FUNCTION(flames_async_sleep)
+{
+    double seconds;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_DOUBLE(seconds)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (seconds <= 0.0) { return; }
+
+    if (g_flames_fiber_executing) {
+        flames_do_async_sleep(seconds);
+    } else {
+        useconds_t usec = (useconds_t)(seconds * 1e6);
+        if (usec > 0) { usleep(usec); }
+    }
+}
+
+/* Replacement for sleep() – non-blocking inside a managed coroutine */
+PHP_FUNCTION(flames_patched_sleep)
+{
+    if (!g_flames_fiber_executing) {
+        orig_sleep_handler(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+        return;
+    }
+    zend_long secs;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_LONG(secs)
+    ZEND_PARSE_PARAMETERS_END();
+    if (secs > 0) { flames_do_async_sleep((double)secs); }
+    RETURN_LONG(0);
+}
+
+/* Replacement for usleep() – non-blocking inside a managed coroutine */
+PHP_FUNCTION(flames_patched_usleep)
+{
+    if (!g_flames_fiber_executing) {
+        orig_usleep_handler(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+        return;
+    }
+    zend_long usec;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_LONG(usec)
+    ZEND_PARSE_PARAMETERS_END();
+    if (usec > 0) { flames_do_async_sleep((double)usec / 1e6); }
+}
+
+/* Monkey-patch sleep() and usleep() at module startup */
+static void flames_patch_sleep_functions(void)
+{
+    zend_function *fn;
+
+    fn = zend_hash_str_find_ptr(CG(function_table), "sleep", sizeof("sleep") - 1);
+    if (fn && fn->type == ZEND_INTERNAL_FUNCTION) {
+        orig_sleep_handler = fn->internal_function.handler;
+        fn->internal_function.handler = zif_flames_patched_sleep;
+    }
+
+    fn = zend_hash_str_find_ptr(CG(function_table), "usleep", sizeof("usleep") - 1);
+    if (fn && fn->type == ZEND_INTERNAL_FUNCTION) {
+        orig_usleep_handler = fn->internal_function.handler;
+        fn->internal_function.handler = zif_flames_patched_usleep;
     }
 }
 
@@ -1294,6 +1436,7 @@ static const zend_function_entry flames_async_functions[] = {
         PHP_FN(flames_c_async_service_version),
         arginfo_get_async_service_version)
     PHP_FE(flames_stream_to_fd, arginfo_flames_stream_to_fd)
+    PHP_FE(flames_async_sleep,  arginfo_flames_async_sleep)
     PHP_FE_END
 };
 PHP_MINIT_FUNCTION(flames_async)
@@ -1305,6 +1448,8 @@ PHP_MINIT_FUNCTION(flames_async)
     if (flames_async_hooks_enabled) {
         flames_hooks_install();
     }
+
+    flames_patch_sleep_functions();
 
     INIT_CLASS_ENTRY(ce, "Flames\\Async\\Async\\Service", flames_async_service_methods);
     flames_async_service_ce = zend_register_internal_class(&ce);

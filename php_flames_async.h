@@ -66,6 +66,7 @@ typedef struct _flames_async_promise {
     int          fd;            /* fd to watch in epoll, -1 = manually resolved */
     int          state;         /* 0=pending  1=resolved  2=rejected */
     int          wait_mode;     /* FLAMES_PROMISE_WAIT_READ or FLAMES_PROMISE_WAIT_READY */
+    int          close_fd;      /* 1 = fd is owned by this promise (timerfd), close on done */
     unsigned int epoll_events;  /* EPOLLIN, EPOLLOUT, … */
     zval         result;
     zend_string *error_msg;
@@ -154,5 +155,10 @@ PHP_METHOD(FlamesAsyncPromise, isPending);
 
 PHP_FUNCTION(flames_c_async_service_version);
 PHP_FUNCTION(flames_stream_to_fd);
+PHP_FUNCTION(flames_async_sleep);
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_flames_async_sleep, 0, 1, IS_VOID, 0)
+    ZEND_ARG_TYPE_INFO(0, seconds, IS_DOUBLE, 0)
+ZEND_END_ARG_INFO()
 
 #endif
