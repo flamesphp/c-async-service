@@ -33,6 +33,10 @@ if test "$PHP_CFLAMES_ASYNC_SERVICE" != "no"; then
     fi
 
     AC_DEFINE(HAVE_FLAMES_ASYNC, 1, [Whether Flames Async is enabled])
+
+    dnl ── libdl for runtime OpenSSL stream-ops resolution (dlsym) ───────────
+    PHP_ADD_LIBRARY(dl, 1, CFLAMES_ASYNC_SERVICE_SHARED_LIBADD)
+
     PHP_NEW_EXTENSION(cflames_async_service, flames_async.c, $ext_shared)
     PHP_SUBST(CFLAMES_ASYNC_SERVICE_SHARED_LIBADD)
     PHP_ADD_MAKEFILE_FRAGMENT
